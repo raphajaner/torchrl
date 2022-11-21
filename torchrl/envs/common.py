@@ -319,7 +319,13 @@ class EnvBase(nn.Module, metaclass=abc.ABCMeta):
         tensordict.is_locked = True  # make sure _step does not modify the tensordict
         tensordict_out = self._step(tensordict)
         tensordict.is_locked = False
-        obs_keys = set(self.observation_spec.keys())
+        #keys = ['/'.join(key) for key in self.observation_spec.keys() if isinstance(key, tuple)]
+        #keys = [[*key] if isinstance(key, tuple) else key for key in obs_keys]
+        obs_keys = list(self.observation_spec.keys())
+        obs_keys = set([k[0] if isinstance(k, tuple) else k for k in obs_keys])
+        #obs_keys = set(keys)
+
+        #obs_keys = set(self.observation_spec.keys())
         tensordict_out_select = tensordict_out.select(*obs_keys)
         tensordict_out = tensordict_out.exclude(*obs_keys)
         tensordict_out["next"] = tensordict_out_select
