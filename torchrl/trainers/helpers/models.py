@@ -3,29 +3,31 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import itertools
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
 import torch
-from torch import nn, distributions as d
+from torch import distributions as d, nn
 
 from torchrl.data import (
     CompositeSpec,
-    NdUnboundedContinuousTensorSpec,
     DiscreteTensorSpec,
+    NdUnboundedContinuousTensorSpec,
 )
 from torchrl.data.utils import DEVICE_TYPING
-from torchrl.envs import TransformedEnv, TensorDictPrimer
+from torchrl.envs import TensorDictPrimer, TransformedEnv
 from torchrl.envs.common import EnvBase
 from torchrl.envs.model_based.dreamer import DreamerEnv
 from torchrl.envs.utils import set_exploration_mode
 from torchrl.modules import (
     ActorValueOperator,
     NoisyLinear,
-    TensorDictModule,
-    ProbabilisticTensorDictModule,
     NormalParamWrapper,
-    TensorDictSequential,
+    SafeModule,
+    SafeProbabilisticModule,
+    SafeProbabilisticSequential,
+    SafeSequential,
 )
 from torchrl.modules.distributions import (
     Delta,
@@ -34,16 +36,14 @@ from torchrl.modules.distributions import (
     TanhNormal,
     TruncatedNormal,
 )
-from torchrl.modules.distributions.continuous import (
-    SafeTanhTransform,
-)
+from torchrl.modules.distributions.continuous import SafeTanhTransform
 from torchrl.modules.models.exploration import LazygSDEModule
 from torchrl.modules.models.model_based import (
     DreamerActor,
-    ObsEncoder,
     ObsDecoder,
-    RSSMPrior,
+    ObsEncoder,
     RSSMPosterior,
+    RSSMPrior,
     RSSMRollout,
 )
 from torchrl.modules.models.models import (
@@ -53,9 +53,9 @@ from torchrl.modules.models.models import (
     DdpgMlpActor,
     DdpgMlpQNet,
     DuelingCnnDQNet,
+    DuelingMlpDQNet,
     LSTMNet,
     MLP,
-    DuelingMlpDQNet,
 )
 from torchrl.modules.tensordict_module import (
     Actor,
@@ -64,12 +64,10 @@ from torchrl.modules.tensordict_module import (
 )
 from torchrl.modules.tensordict_module.actors import (
     ActorCriticWrapper,
-    ValueOperator,
     ProbabilisticActor,
+    ValueOperator,
 )
-from torchrl.modules.tensordict_module.world_models import (
-    WorldModelWrapper,
-)
+from torchrl.modules.tensordict_module.world_models import WorldModelWrapper
 from torchrl.trainers.helpers import transformed_env_constructor
 
 DISTRIBUTIONS = {
@@ -169,9 +167,8 @@ def make_dqn_actor(
             "mlp_kwargs_output": {"num_cells": 512, "layer_class": linear_layer_class},
         }
         # automatically infer in key
-        in_key = list(env_specs["observation_spec"])[0]
+        (in_key,) = itertools.islice(env_specs["observation_spec"], 1)
 
-    out_features = action_spec.shape[0]
     actor_class = QValueActor
     actor_kwargs = {}
 
@@ -180,6 +177,8 @@ def make_dqn_actor(
         # to the number of possible choices and also set categorical behavioural for actors.
         actor_kwargs.update({"action_space": "categorical"})
         out_features = env_specs["action_spec"].space.n
+    else:
+        out_features = action_spec.shape[0]
 
     if cfg.distributional:
         if not atoms:
@@ -289,8 +288,8 @@ def make_ddpg_actor(
     from_pixels = cfg.from_pixels
     noisy = cfg.noisy
 
-    actor_net_kwargs = actor_net_kwargs if actor_net_kwargs is not None else dict()
-    value_net_kwargs = value_net_kwargs if value_net_kwargs is not None else dict()
+    actor_net_kwargs = actor_net_kwargs if actor_net_kwargs is not None else {}
+    value_net_kwargs = value_net_kwargs if value_net_kwargs is not None else {}
 
     linear_layer_class = torch.nn.Linear if not noisy else NoisyLinear
 
@@ -318,7 +317,7 @@ def make_ddpg_actor(
         actor_net = DdpgMlpActor(**actor_net_default_kwargs)
         gSDE_state_key = "observation_vector"
         out_keys = ["param"]
-    actor_module = TensorDictModule(actor_net, in_keys=in_keys, out_keys=out_keys)
+    actor_module = SafeModule(actor_net, in_keys=in_keys, out_keys=out_keys)
 
     if cfg.gSDE:
         min = env_specs["action_spec"].space.minimum
@@ -328,9 +327,9 @@ def make_ddpg_actor(
             transform = d.ComposeTransform(
                 transform, d.AffineTransform(loc=(max + min) / 2, scale=(max - min) / 2)
             )
-        actor_module = TensorDictSequential(
+        actor_module = SafeSequential(
             actor_module,
-            TensorDictModule(
+            SafeModule(
                 LazygSDEModule(transform=transform, learn_sigma=False),
                 in_keys=["param", gSDE_state_key, "_eps_gSDE"],
                 out_keys=["loc", "scale", "action", "_eps_gSDE"],
@@ -341,7 +340,7 @@ def make_ddpg_actor(
     # distribution.
     actor = ProbabilisticActor(
         module=actor_module,
-        dist_in_keys=["param"],
+        in_keys=["param"],
         spec=CompositeSpec(action=env_specs["action_spec"]),
         safe=True,
         distribution_class=TanhDelta,
@@ -412,6 +411,301 @@ def make_ddpg_actor(
         module[1](td)
 
     return module
+
+
+def make_a2c_model(
+    proof_environment: EnvBase,
+    cfg: "DictConfig",  # noqa: F821
+    device: DEVICE_TYPING,
+    in_keys_actor: Optional[Sequence[str]] = None,
+    observation_key=None,
+    **kwargs,
+) -> ActorValueOperator:
+    """Actor-value model constructor helper function.
+
+    Currently constructs MLP networks with immutable default arguments as described in "Proximal Policy Optimization
+    Algorithms", https://arxiv.org/abs/1707.06347
+    Other configurations can easily be implemented by modifying this function at will.
+
+    Args:
+        proof_environment (EnvBase): a dummy environment to retrieve the observation and action spec
+        cfg (DictConfig): contains arguments of the PPO script
+        device (torch.device): device on which the model must be cast.
+        in_keys_actor (iterable of strings, optional): observation key to be read by the actor, usually one of
+            `'observation_vector'` or `'pixels'`. If none is provided, one of these two keys is chosen based on
+            the `cfg.from_pixels` argument.
+
+    Returns:
+         A joined ActorCriticOperator.
+
+    Examples:
+        >>> from torchrl.trainers.helpers.envs import parser_env_args
+        >>> from torchrl.trainers.helpers.models import make_ppo_model, parser_model_args_continuous
+        >>> from torchrl.envs.libs.gym import GymEnv
+        >>> from torchrl.envs.transforms import CatTensors, TransformedEnv, DoubleToFloat, Compose
+        >>> import hydra
+        >>> from hydra.core.config_store import ConfigStore
+        >>> import dataclasses
+        >>> proof_environment = TransformedEnv(GymEnv("HalfCheetah-v2"), Compose(DoubleToFloat(["observation"]),
+        ...    CatTensors(["observation"], "observation_vector")))
+        >>> device = torch.device("cpu")
+        >>> config_fields = [(config_field.name, config_field.type, config_field) for config_cls in
+        ...                    (PPOModelConfig, EnvConfig)
+        ...                   for config_field in dataclasses.fields(config_cls)]
+        >>> Config = dataclasses.make_dataclass(cls_name="Config", fields=config_fields)
+        >>> cs = ConfigStore.instance()
+        >>> cs.store(name="config", node=Config)
+        >>> with initialize(config_path=None):
+        >>>     cfg = compose(config_name="config")
+        >>> actor_value = make_ppo_model(
+        ...     proof_environment,
+        ...     device=device,
+        ...     cfg=cfg,
+        ...     )
+        >>> actor = actor_value.get_policy_operator()
+        >>> value = actor_value.get_value_operator()
+        >>> td = proof_environment.reset()
+        >>> print(actor(td.clone()))
+        TensorDict(
+            fields={
+                done: Tensor(torch.Size([1]), dtype=torch.bool),
+                observation_vector: Tensor(torch.Size([17]), dtype=torch.float32),
+                hidden: Tensor(torch.Size([300]), dtype=torch.float32),
+                loc: Tensor(torch.Size([6]), dtype=torch.float32),
+                scale: Tensor(torch.Size([6]), dtype=torch.float32),
+                action: Tensor(torch.Size([6]), dtype=torch.float32),
+                sample_log_prob: Tensor(torch.Size([1]), dtype=torch.float32)},
+            batch_size=torch.Size([]),
+            device=cpu,
+            is_shared=False)
+        >>> print(value(td.clone()))
+        TensorDict(
+            fields={
+                done: Tensor(torch.Size([1]), dtype=torch.bool),
+                observation_vector: Tensor(torch.Size([17]), dtype=torch.float32),
+                hidden: Tensor(torch.Size([300]), dtype=torch.float32),
+                state_value: Tensor(torch.Size([1]), dtype=torch.float32)},
+            batch_size=torch.Size([]),
+            device=cpu,
+            is_shared=False)
+
+    """
+    # proof_environment.set_seed(cfg.seed)
+    specs = proof_environment.specs  # TODO: use env.sepcs
+    action_spec = specs["action_spec"]
+
+    if in_keys_actor is None and proof_environment.from_pixels:
+        in_keys_actor = ["pixels"]
+        in_keys_critic = ["pixels"]
+    elif in_keys_actor is None:
+        in_keys_actor = ["observation_vector"]
+        in_keys_critic = ["observation_vector"]
+    out_keys = ["action"]
+
+    if action_spec.domain == "continuous":
+        dist_in_keys = ["loc", "scale"]
+        out_features = (2 - cfg.gSDE) * action_spec.shape[-1]
+        if cfg.distribution == "tanh_normal":
+            policy_distribution_kwargs = {
+                "min": action_spec.space.minimum,
+                "max": action_spec.space.maximum,
+                "tanh_loc": cfg.tanh_loc,
+            }
+            policy_distribution_class = TanhNormal
+        elif cfg.distribution == "truncated_normal":
+            policy_distribution_kwargs = {
+                "min": action_spec.space.minimum,
+                "max": action_spec.space.maximum,
+                "tanh_loc": cfg.tanh_loc,
+            }
+            policy_distribution_class = TruncatedNormal
+    elif action_spec.domain == "discrete":
+        out_features = action_spec.shape[-1]
+        policy_distribution_kwargs = {}
+        policy_distribution_class = OneHotCategorical
+        dist_in_keys = ["logits"]
+    else:
+        raise NotImplementedError(
+            f"actions with domain {action_spec.domain} are not supported"
+        )
+
+    if cfg.shared_mapping:
+        hidden_features = 300
+        if proof_environment.from_pixels:
+            if in_keys_actor is None:
+                in_keys_actor = ["pixels"]
+            common_module = ConvNet(
+                bias_last_layer=True,
+                depth=None,
+                num_cells=[32, 64, 64],
+                kernel_sizes=[8, 4, 3],
+                strides=[4, 2, 1],
+            )
+        else:
+            if cfg.lstm:
+                raise NotImplementedError(
+                    "lstm not yet compatible with shared mapping for A2C"
+                )
+            common_module = MLP(
+                num_cells=[
+                    64,
+                ],
+                out_features=hidden_features,
+                activate_last_layer=True,
+            )
+        common_operator = SafeModule(
+            spec=None,
+            module=common_module,
+            in_keys=in_keys_actor,
+            out_keys=["hidden"],
+        )
+
+        policy_net = MLP(
+            num_cells=[64],
+            out_features=out_features,
+        )
+
+        shared_out_keys = ["hidden"]
+        if not cfg.gSDE:
+            if action_spec.domain == "continuous":
+                policy_net = NormalParamWrapper(
+                    policy_net,
+                    scale_mapping=f"biased_softplus_{cfg.default_policy_scale}",
+                )
+            actor_module = SafeModule(
+                policy_net, in_keys=shared_out_keys, out_keys=dist_in_keys
+            )
+        else:
+            gSDE_state_key = "hidden"
+            actor_module = SafeModule(
+                policy_net,
+                in_keys=shared_out_keys,
+                out_keys=["action"],  # will be overwritten
+            )
+
+            if action_spec.domain == "continuous":
+                min = action_spec.space.minimum
+                max = action_spec.space.maximum
+                transform = SafeTanhTransform()
+                if (min != -1).any() or (max != 1).any():
+                    transform = d.ComposeTransform(
+                        transform,
+                        d.AffineTransform(loc=(max + min) / 2, scale=(max - min) / 2),
+                    )
+            else:
+                raise RuntimeError("cannot use gSDE with discrete actions")
+
+            actor_module = SafeSequential(
+                actor_module,
+                SafeModule(
+                    LazygSDEModule(transform=transform),
+                    in_keys=["action", gSDE_state_key, "_eps_gSD"],
+                    out_keys=["loc", "scale", "action", "_eps_gSDE"],
+                ),
+            )
+
+        policy_operator = ProbabilisticActor(
+            spec=CompositeSpec(action=action_spec),
+            module=actor_module,
+            in_keys=dist_in_keys,
+            default_interaction_mode="random",
+            distribution_class=policy_distribution_class,
+            distribution_kwargs=policy_distribution_kwargs,
+            return_log_prob=True,
+        )
+        value_net = MLP(
+            num_cells=[64],
+            out_features=1,
+        )
+        value_operator = ValueOperator(value_net, in_keys=shared_out_keys)
+        actor_value = ActorValueOperator(
+            common_operator=common_operator,
+            policy_operator=policy_operator,
+            value_operator=value_operator,
+        ).to(device)
+    else:
+        if cfg.from_pixels:
+            raise RuntimeError(
+                "A2C learnt from pixels require the shared_mapping to be set to True."
+            )
+        if cfg.lstm:
+            policy_net = LSTMNet(
+                out_features=out_features,
+                lstm_kwargs={"input_size": 64, "hidden_size": 64},
+                mlp_kwargs={"num_cells": [64, 64], "out_features": 64},
+            )
+            in_keys_actor += ["hidden0", "hidden1"]
+            out_keys += ["hidden0", "hidden1", ("next", "hidden0"), ("next", "hidden1")]
+        else:
+            policy_net = MLP(
+                num_cells=[64, 64],
+                out_features=out_features,
+            )
+
+        if not cfg.gSDE:
+            if action_spec.domain == "continuous":
+                policy_net = NormalParamWrapper(
+                    policy_net,
+                    scale_mapping=f"biased_softplus_{cfg.default_policy_scale}",
+                )
+            actor_module = SafeModule(
+                policy_net, in_keys=in_keys_actor, out_keys=dist_in_keys
+            )
+        else:
+            in_keys = in_keys_actor
+            gSDE_state_key = in_keys_actor[0]
+            actor_module = SafeModule(
+                policy_net,
+                in_keys=in_keys,
+                out_keys=["action"],  # will be overwritten
+            )
+
+            if action_spec.domain == "continuous":
+                min = action_spec.space.minimum
+                max = action_spec.space.maximum
+                transform = SafeTanhTransform()
+                if (min != -1).any() or (max != 1).any():
+                    transform = d.ComposeTransform(
+                        transform,
+                        d.AffineTransform(loc=(max + min) / 2, scale=(max - min) / 2),
+                    )
+            else:
+                raise RuntimeError("cannot use gSDE with discrete actions")
+
+            actor_module = SafeSequential(
+                actor_module,
+                SafeModule(
+                    LazygSDEModule(transform=transform),
+                    in_keys=["action", gSDE_state_key, "_eps_gSDE"],
+                    out_keys=["loc", "scale", "action", "_eps_gSDE"],
+                ),
+            )
+
+        policy_po = ProbabilisticActor(
+            actor_module,
+            spec=action_spec,
+            in_keys=dist_in_keys,
+            distribution_class=policy_distribution_class,
+            distribution_kwargs=policy_distribution_kwargs,
+            return_log_prob=True,
+            default_interaction_mode="random",
+        )
+
+        value_net = MLP(
+            num_cells=[64, 64],
+            out_features=1,
+        )
+        value_po = ValueOperator(
+            value_net,
+            in_keys=in_keys_critic,
+        )
+        actor_value = ActorCriticWrapper(policy_po, value_po).to(device)
+
+    with torch.no_grad(), set_exploration_mode("random"):
+        td = proof_environment.rollout(max_steps=1000)
+        td_device = td.to(device)
+        td_device = actor_value(td_device)  # for init
+    return actor_value
 
 
 def make_ppo_model(
@@ -504,6 +798,7 @@ def make_ppo_model(
     out_keys = ["action"]
 
     if action_spec.domain == "continuous":
+        dist_in_keys = ["loc", "scale"]
         out_features = (2 - cfg.gSDE) * action_spec.shape[-1]
         if cfg.distribution == "tanh_normal":
             policy_distribution_kwargs = {
@@ -523,6 +818,7 @@ def make_ppo_model(
         out_features = action_spec.shape[-1]
         policy_distribution_kwargs = {}
         policy_distribution_class = OneHotCategorical
+        dist_in_keys = ["logits"]
     else:
         raise NotImplementedError(
             f"actions with domain {action_spec.domain} are not supported"
@@ -552,7 +848,7 @@ def make_ppo_model(
                 out_features=hidden_features,
                 activate_last_layer=True,
             )
-        common_operator = TensorDictModule(
+        common_operator = SafeModule(
             spec=None,
             module=common_module,
             in_keys=in_keys_actor,
@@ -563,20 +859,22 @@ def make_ppo_model(
             num_cells=[200],
             out_features=out_features,
         )
+
+        shared_out_keys = ["hidden"]
         if not cfg.gSDE:
-            actor_net = NormalParamWrapper(
-                policy_net, scale_mapping=f"biased_softplus_{cfg.default_policy_scale}"
-            )
-            in_keys = ["hidden"]
-            actor_module = TensorDictModule(
-                actor_net, in_keys=in_keys, out_keys=["loc", "scale"]
+            if action_spec.domain == "continuous":
+                policy_net = NormalParamWrapper(
+                    policy_net,
+                    scale_mapping=f"biased_softplus_{cfg.default_policy_scale}",
+                )
+            actor_module = SafeModule(
+                policy_net, in_keys=shared_out_keys, out_keys=dist_in_keys
             )
         else:
-            in_keys = ["hidden"]
             gSDE_state_key = "hidden"
-            actor_module = TensorDictModule(
+            actor_module = SafeModule(
                 policy_net,
-                in_keys=in_keys,
+                in_keys=shared_out_keys,
                 out_keys=["action"],  # will be overwritten
             )
 
@@ -592,11 +890,11 @@ def make_ppo_model(
             else:
                 raise RuntimeError("cannot use gSDE with discrete actions")
 
-            actor_module = TensorDictSequential(
+            actor_module = SafeSequential(
                 actor_module,
-                TensorDictModule(
+                SafeModule(
                     LazygSDEModule(transform=transform),
-                    in_keys=["action", gSDE_state_key, "_eps_gSDE"],
+                    in_keys=["action", gSDE_state_key, "_eps_gSD"],
                     out_keys=["loc", "scale", "action", "_eps_gSDE"],
                 ),
             )
@@ -604,7 +902,7 @@ def make_ppo_model(
         policy_operator = ProbabilisticActor(
             spec=CompositeSpec(action=action_spec),
             module=actor_module,
-            dist_in_keys=["loc", "scale"],
+            in_keys=dist_in_keys,
             default_interaction_mode="random",
             distribution_class=policy_distribution_class,
             distribution_kwargs=policy_distribution_kwargs,
@@ -614,7 +912,7 @@ def make_ppo_model(
             num_cells=[200],
             out_features=1,
         )
-        value_operator = ValueOperator(value_net, in_keys=["hidden"])
+        value_operator = ValueOperator(value_net, in_keys=shared_out_keys)
         actor_value = ActorValueOperator(
             common_operator=common_operator,
             policy_operator=policy_operator,
@@ -640,16 +938,18 @@ def make_ppo_model(
             )
 
         if not cfg.gSDE:
-            actor_net = NormalParamWrapper(
-                policy_net, scale_mapping=f"biased_softplus_{cfg.default_policy_scale}"
-            )
-            actor_module = TensorDictModule(
-                actor_net, in_keys=in_keys_actor, out_keys=["loc", "scale"]
+            if action_spec.domain == "continuous":
+                policy_net = NormalParamWrapper(
+                    policy_net,
+                    scale_mapping=f"biased_softplus_{cfg.default_policy_scale}",
+                )
+            actor_module = SafeModule(
+                policy_net, in_keys=in_keys_actor, out_keys=dist_in_keys
             )
         else:
             in_keys = in_keys_actor
             gSDE_state_key = in_keys_actor[0]
-            actor_module = TensorDictModule(
+            actor_module = SafeModule(
                 policy_net,
                 in_keys=in_keys,
                 out_keys=["action"],  # will be overwritten
@@ -667,9 +967,9 @@ def make_ppo_model(
             else:
                 raise RuntimeError("cannot use gSDE with discrete actions")
 
-            actor_module = TensorDictSequential(
+            actor_module = SafeSequential(
                 actor_module,
-                TensorDictModule(
+                SafeModule(
                     LazygSDEModule(transform=transform),
                     in_keys=["action", gSDE_state_key, "_eps_gSDE"],
                     out_keys=["loc", "scale", "action", "_eps_gSDE"],
@@ -679,7 +979,7 @@ def make_ppo_model(
         policy_po = ProbabilisticActor(
             actor_module,
             spec=action_spec,
-            dist_in_keys=["loc", "scale"],
+            in_keys=dist_in_keys,
             distribution_class=policy_distribution_class,
             distribution_kwargs=policy_distribution_kwargs,
             return_log_prob=True,
@@ -854,7 +1154,7 @@ def make_sac_model(
             scale_lb=cfg.scale_lb,
         )
         in_keys_actor = in_keys
-        actor_module = TensorDictModule(
+        actor_module = SafeModule(
             actor_net,
             in_keys=in_keys_actor,
             out_keys=[
@@ -865,7 +1165,7 @@ def make_sac_model(
 
     else:
         gSDE_state_key = in_keys[0]
-        actor_module = TensorDictModule(
+        actor_module = SafeModule(
             actor_net,
             in_keys=in_keys,
             out_keys=["action"],  # will be overwritten
@@ -883,9 +1183,9 @@ def make_sac_model(
         else:
             raise RuntimeError("cannot use gSDE with discrete actions")
 
-        actor_module = TensorDictSequential(
+        actor_module = SafeSequential(
             actor_module,
-            TensorDictModule(
+            SafeModule(
                 LazygSDEModule(transform=transform),
                 in_keys=["action", gSDE_state_key, "_eps_gSDE"],
                 out_keys=["loc", "scale", "action", "_eps_gSDE"],
@@ -894,7 +1194,7 @@ def make_sac_model(
 
     actor = ProbabilisticActor(
         spec=action_spec,
-        dist_in_keys=["loc", "scale"],
+        in_keys=["loc", "scale"],
         module=actor_module,
         distribution_class=dist_class,
         distribution_kwargs=dist_kwargs,
@@ -1101,14 +1401,14 @@ def make_redq_model(
             scale_mapping=f"biased_softplus_{default_policy_scale}",
             scale_lb=cfg.scale_lb,
         )
-        actor_module = TensorDictModule(
+        actor_module = SafeModule(
             actor_net,
             in_keys=in_keys_actor,
             out_keys=["loc", "scale"] + out_keys_actor[1:],
         )
 
     else:
-        actor_module = TensorDictModule(
+        actor_module = SafeModule(
             actor_net,
             in_keys=in_keys_actor,
             out_keys=["action"] + out_keys_actor[1:],  # will be overwritten
@@ -1126,9 +1426,9 @@ def make_redq_model(
         else:
             raise RuntimeError("cannot use gSDE with discrete actions")
 
-        actor_module = TensorDictSequential(
+        actor_module = SafeSequential(
             actor_module,
-            TensorDictModule(
+            SafeModule(
                 LazygSDEModule(transform=transform),
                 in_keys=["action", gSDE_state_key, "_eps_gSDE"],
                 out_keys=["loc", "scale", "action", "_eps_gSDE"],
@@ -1137,7 +1437,7 @@ def make_redq_model(
 
     actor = ProbabilisticActor(
         spec=action_spec,
-        dist_in_keys=["loc", "scale"],
+        in_keys=["loc", "scale"],
         module=actor_module,
         distribution_class=dist_class,
         distribution_kwargs=dist_kwargs,
@@ -1167,7 +1467,7 @@ def make_dreamer(
     action_key: str = "action",
     value_key: str = "state_value",
     use_decoder_in_env: bool = False,
-    stats: Optional[dict] = None,
+    obs_norm_state_dict=None,
 ) -> nn.ModuleList:
     """Create Dreamer components.
 
@@ -1182,8 +1482,8 @@ def make_dreamer(
             Defaults to "state_value".
         use_decoder_in_env (bool, optional): Whether to use the decoder in the model based dreamer env.
             Defaults to False.
-        stats (Optional[dict], optional): Stats to use for normalization.
-            Defaults to None.
+        obs_norm_state_dict (dict, optional): the state_dict of the ObservationNorm transform used
+            when proof_environment is missing. Defaults to None.
 
     Returns:
         nn.TensorDictModel: Dreamer World model.
@@ -1196,7 +1496,7 @@ def make_dreamer(
     proof_env_is_none = proof_environment is None
     if proof_env_is_none:
         proof_environment = transformed_env_constructor(
-            cfg=cfg, use_env_creator=False, stats=stats
+            cfg=cfg, use_env_creator=False, obs_norm_state_dict=obs_norm_state_dict
         )()
 
     # Modules
@@ -1269,7 +1569,7 @@ def _dreamer_make_world_model(
 ):
     # World Model and reward model
     rssm_rollout = RSSMRollout(
-        TensorDictModule(
+        SafeModule(
             rssm_prior,
             in_keys=["state", "belief", "action"],
             out_keys=[
@@ -1279,7 +1579,7 @@ def _dreamer_make_world_model(
                 ("next", "belief"),
             ],
         ),
-        TensorDictModule(
+        SafeModule(
             rssm_posterior,
             in_keys=[("next", "belief"), ("next", "encoded_latents")],
             out_keys=[
@@ -1290,20 +1590,20 @@ def _dreamer_make_world_model(
         ),
     )
 
-    transition_model = TensorDictSequential(
-        TensorDictModule(
+    transition_model = SafeSequential(
+        SafeModule(
             obs_encoder,
             in_keys=[("next", "pixels")],
             out_keys=[("next", "encoded_latents")],
         ),
         rssm_rollout,
-        TensorDictModule(
+        SafeModule(
             obs_decoder,
             in_keys=[("next", "state"), ("next", "belief")],
             out_keys=[("next", "reco_pixels")],
         ),
     )
-    reward_model = TensorDictModule(
+    reward_model = SafeModule(
         reward_module,
         in_keys=[("next", "state"), ("next", "belief")],
         out_keys=["reward"],
@@ -1344,28 +1644,30 @@ def _dreamer_make_actors(
 
 
 def _dreamer_make_actor_sim(action_key, proof_environment, actor_module):
-    actor_simulator = ProbabilisticTensorDictModule(
-        TensorDictModule(
+    actor_simulator = SafeProbabilisticSequential(
+        SafeModule(
             actor_module,
             in_keys=["state", "belief"],
             out_keys=["loc", "scale"],
+            spec=CompositeSpec(
+                **{
+                    "loc": NdUnboundedContinuousTensorSpec(
+                        proof_environment.action_spec.shape,
+                        device=proof_environment.action_spec.device,
+                    ),
+                    "scale": NdUnboundedContinuousTensorSpec(
+                        proof_environment.action_spec.shape,
+                        device=proof_environment.action_spec.device,
+                    ),
+                }
+            ),
         ),
-        dist_in_keys=["loc", "scale"],
-        sample_out_key=[action_key],
-        default_interaction_mode="random",
-        distribution_class=TanhNormal,
-        spec=CompositeSpec(
-            **{
-                action_key: proof_environment.action_spec,
-                "loc": NdUnboundedContinuousTensorSpec(
-                    proof_environment.action_spec.shape,
-                    device=proof_environment.action_spec.device,
-                ),
-                "scale": NdUnboundedContinuousTensorSpec(
-                    proof_environment.action_spec.shape,
-                    device=proof_environment.action_spec.device,
-                ),
-            }
+        SafeProbabilisticModule(
+            in_keys=["loc", "scale"],
+            out_keys=[action_key],
+            default_interaction_mode="random",
+            distribution_class=TanhNormal,
+            spec=CompositeSpec(**{action_key: proof_environment.action_spec}),
         ),
     )
     return actor_simulator
@@ -1377,13 +1679,13 @@ def _dreamer_make_actor_real(
     # actor for real world: interacts with states ~ posterior
     # Out actor differs from the original paper where first they compute prior and posterior and then act on it
     # but we found that this approach worked better.
-    actor_realworld = TensorDictSequential(
-        TensorDictModule(
+    actor_realworld = SafeSequential(
+        SafeModule(
             obs_encoder,
             in_keys=["pixels"],
             out_keys=["encoded_latents"],
         ),
-        TensorDictModule(
+        SafeModule(
             rssm_posterior,
             in_keys=["belief", "encoded_latents"],
             out_keys=[
@@ -1392,29 +1694,33 @@ def _dreamer_make_actor_real(
                 "state",
             ],
         ),
-        ProbabilisticTensorDictModule(
-            TensorDictModule(
+        SafeProbabilisticSequential(
+            SafeModule(
                 actor_module,
                 in_keys=["state", "belief"],
                 out_keys=["loc", "scale"],
+                spec=CompositeSpec(
+                    **{
+                        "loc": NdUnboundedContinuousTensorSpec(
+                            proof_environment.action_spec.shape,
+                        ),
+                        "scale": NdUnboundedContinuousTensorSpec(
+                            proof_environment.action_spec.shape,
+                        ),
+                    }
+                ),
             ),
-            dist_in_keys=["loc", "scale"],
-            sample_out_key=[action_key],
-            default_interaction_mode="random",
-            distribution_class=TanhNormal,
-            spec=CompositeSpec(
-                **{
-                    action_key: proof_environment.action_spec.to("cpu"),
-                    "loc": NdUnboundedContinuousTensorSpec(
-                        proof_environment.action_spec.shape,
-                    ),
-                    "scale": NdUnboundedContinuousTensorSpec(
-                        proof_environment.action_spec.shape,
-                    ),
-                }
+            SafeProbabilisticModule(
+                in_keys=["loc", "scale"],
+                out_keys=[action_key],
+                default_interaction_mode="random",
+                distribution_class=TanhNormal,
+                spec=CompositeSpec(
+                    **{action_key: proof_environment.action_spec.to("cpu")}
+                ),
             ),
         ),
-        TensorDictModule(
+        SafeModule(
             rssm_prior,
             in_keys=["state", "belief", action_key],
             out_keys=[
@@ -1430,7 +1736,7 @@ def _dreamer_make_actor_real(
 
 def _dreamer_make_value_model(mlp_num_units, value_key):
     # actor for simulator: interacts with states ~ prior
-    value_model = TensorDictModule(
+    value_model = SafeModule(
         MLP(
             out_features=1,
             depth=3,
@@ -1454,7 +1760,7 @@ def _dreamer_make_mbenv(
 ):
     # MB environment
     if use_decoder_in_env:
-        mb_env_obs_decoder = TensorDictModule(
+        mb_env_obs_decoder = SafeModule(
             obs_decoder,
             in_keys=[("next", "state"), ("next", "belief")],
             out_keys=[("next", "reco_pixels")],
@@ -1462,8 +1768,8 @@ def _dreamer_make_mbenv(
     else:
         mb_env_obs_decoder = None
 
-    transition_model = TensorDictSequential(
-        TensorDictModule(
+    transition_model = SafeSequential(
+        SafeModule(
             rssm_prior,
             in_keys=["state", "belief", "action"],
             out_keys=[
@@ -1474,7 +1780,7 @@ def _dreamer_make_mbenv(
             ],
         ),
     )
-    reward_model = TensorDictModule(
+    reward_model = SafeModule(
         reward_module,
         in_keys=["state", "belief"],
         out_keys=["reward"],
@@ -1523,6 +1829,25 @@ class DreamerConfig:
 @dataclass
 class PPOModelConfig:
     """PPO model config struct."""
+
+    gSDE: bool = False
+    # if True, exploration is achieved using the gSDE technique.
+    tanh_loc: bool = False
+    # if True, uses a Tanh-Normal transform for the policy location of the form
+    # upscale * tanh(loc/upscale) (only available with TanhTransform and TruncatedGaussian distributions)
+    default_policy_scale: float = 1.0
+    # Default policy scale parameter
+    distribution: str = "tanh_normal"
+    # if True, uses a Tanh-Normal-Tanh distribution for the policy
+    lstm: bool = False
+    # if True, uses an LSTM for the policy.
+    shared_mapping: bool = False
+    # if True, the first layers of the actor-critic are shared.
+
+
+@dataclass
+class A2CModelConfig:
+    """A2C model config struct."""
 
     gSDE: bool = False
     # if True, exploration is achieved using the gSDE technique.
