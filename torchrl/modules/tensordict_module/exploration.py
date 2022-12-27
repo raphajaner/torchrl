@@ -173,7 +173,7 @@ class AdditiveGaussianWrapper(TensorDictModuleWrapper):
         super().__init__(policy)
         self.register_buffer("sigma_init", torch.tensor([sigma_init]))
         self.register_buffer("sigma_end", torch.tensor([sigma_end]))
-        if self.sigma_end > self.sigma_init:
+        if any((self.sigma_end > self.sigma_init).flatten()):
             raise RuntimeError("sigma should decrease over time or be constant")
         self.annealing_num_steps = annealing_num_steps
         self.register_buffer("sigma", torch.tensor([sigma_init]))
@@ -197,17 +197,17 @@ class AdditiveGaussianWrapper(TensorDictModuleWrapper):
 
         """
         for _ in range(frames):
-            self.sigma.data[0] = max(
-                self.sigma_end.item(),
+            self.sigma.data[0] = torch.tensor(np.maximum(
+                self.sigma_end.numpy(),
                 (
                     self.sigma
                     - (self.sigma_init - self.sigma_end) / self.annealing_num_steps
-                ).item(),
-            )
+                ).numpy(),
+            ))
 
     def _add_noise(self, action: torch.Tensor) -> torch.Tensor:
-        sigma = self.sigma.item()
-        noise = torch.randn(action.shape, device=action.device) * sigma
+        sigma = self.sigma.numpy()
+        noise = torch.randn(action.shape, device=action.device) * sigma[0]
         action = action + noise
         spec = self.spec
         if isinstance(spec, CompositeSpec):

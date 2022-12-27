@@ -329,6 +329,8 @@ def next_state_value(
     rewards = tensordict.get("reward").squeeze(-1)
     done = tensordict.get("done").squeeze(-1)
 
+#    truncated = tensordict.get("next").get("truncated").squeeze(-1)
+
     if pred_next_val is None:
         next_td = step_mdp(tensordict)  # next_observation -> observation
         next_td = next_td.select(*operator.in_keys)
@@ -337,6 +339,7 @@ def next_state_value(
     else:
         pred_next_val_detach = pred_next_val.squeeze(-1)
     done = done.to(torch.float)
+    #target_value = (1 - (done-truncated)) * pred_next_val_detach
     target_value = (1 - done) * pred_next_val_detach
     rewards = rewards.to(torch.float)
     target_value = rewards + (gamma**steps_to_next_obs) * target_value
