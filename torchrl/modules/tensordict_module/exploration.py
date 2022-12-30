@@ -197,16 +197,16 @@ class AdditiveGaussianWrapper(TensorDictModuleWrapper):
 
         """
         for _ in range(frames):
-            self.sigma.data[0] = torch.tensor(np.maximum(
-                self.sigma_end.numpy(),
+            self.sigma.data[0] = torch.tensor(torch.maximum(
+                self.sigma_end,
                 (
                     self.sigma
                     - (self.sigma_init - self.sigma_end) / self.annealing_num_steps
-                ).numpy(),
+                ),
             ))
 
     def _add_noise(self, action: torch.Tensor) -> torch.Tensor:
-        sigma = self.sigma.numpy()
+        sigma = self.sigma
         noise = torch.randn(action.shape, device=action.device) * sigma[0]
         action = action + noise
         spec = self.spec
