@@ -134,7 +134,10 @@ class DDPGLoss(LossModule):
                 td_copy,
                 params=params,
             )
-        return -td_copy.get("state_action_value")
+        loss_actor = -td_copy.get("state_action_value")
+        if '_weight' in tensordict['_weight']:
+            loss_actor = loss_actor.squeeze(-1) * tensordict['_weight']
+        return loss_actor
 
     def _loss_value(
         self,
@@ -171,5 +174,6 @@ class DDPGLoss(LossModule):
         loss_value = distance_loss(
             pred_val, target_value, loss_function=self.loss_funtion
         )
-
+        if '_weight' in tensordict['_weight']:
+            loss_value = loss_value * tensordict['_weight']
         return loss_value, (pred_val - target_value).pow(2), pred_val, target_value
